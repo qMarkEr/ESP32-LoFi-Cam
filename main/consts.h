@@ -34,7 +34,7 @@
 typedef struct {
   uint8_t r, g, b;
   int dst;
-} Color;
+} __packed Color;
 
 extern const uint8_t DB[8];
 extern const int8_t bayer8x8[8][8];
