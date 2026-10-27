@@ -173,7 +173,7 @@ void app_main(void)
         strips[i] = heap_caps_malloc(STRIP_BYTES, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
         ESP_ERROR_CHECK(strips[i] ? ESP_OK : ESP_ERR_NO_MEM);
     }
-    img_process_init();
+
 
     free_strip_buffers = xSemaphoreCreateCounting(STRIP_BUFFERS, STRIP_BUFFERS);
     ESP_ERROR_CHECK(free_strip_buffers ? ESP_OK : ESP_ERR_NO_MEM);
