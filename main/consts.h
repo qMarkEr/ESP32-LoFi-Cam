@@ -38,4 +38,4 @@ typedef struct {
 
 extern const uint8_t DB[8];
 extern const int8_t bayer8x8[8][8];
-extern const Color palettesss[8][PALETTE_SIZE];
+extern const Color palettesss[9][PALETTE_SIZE];

@@ -1,13 +1,13 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "driver/spi_master.h"
 #include "esp_camera.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_psram.h"
-#include "esp_timer.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
@@ -159,10 +159,29 @@ static esp_err_t init_camera(void)
     return esp_camera_init(&config);
 }
 
+static void setup_camera() {
+    ESP_ERROR_CHECK(init_camera());
+
+    sensor_t *cm = esp_camera_sensor_get();
+    cm->set_saturation(cm, 2);
+    cm->set_whitebal(cm, 1);
+    cm->set_denoise(cm, 0);
+    cm->set_awb_gain(cm, 1);
+    cm->set_wb_mode(cm, 0);
+    cm->set_brightness(cm, 1);
+    cm->set_contrast(cm, 2);
+    cm->set_special_effect(cm, 0);
+    cm->set_lenc(cm, 1);
+    cm->set_gain_ctrl(cm, 1);
+    cm->set_exposure_ctrl(cm, 1);
+    cm->set_aec2(cm, 1);
+    cm->set_ae_level(cm, 0);
+    cm->set_gainceiling(cm, GAINCEILING_128X);
+}
+
 void app_main(void)
 {
     if (!esp_psram_is_initialized()) {
-        // ESP_LOGE(TAG, "PSRAM is required for camera frame buffers");
         return;
     }
 
@@ -185,56 +204,18 @@ void app_main(void)
     ESP_ERROR_CHECK(worker_created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 
     ESP_ERROR_CHECK(init_display());
-    ESP_ERROR_CHECK(init_camera());
+    setup_camera();
 
-    sensor_t *cm = esp_camera_sensor_get();
-    ESP_ERROR_CHECK(cm ? ESP_OK : ESP_FAIL);
-    ESP_ERROR_CHECK(cm->set_denoise ? cm->set_denoise(cm, 0) : ESP_ERR_NOT_SUPPORTED);
-    ESP_ERROR_CHECK(cm->set_awb_gain ? cm->set_awb_gain(cm, 0) : ESP_ERR_NOT_SUPPORTED);
-
-    int64_t dither_window_start_us = esp_timer_get_time();
-    int64_t previous_frame_timestamp_us = 0;
-    int64_t last_frame_delta_us = 0;
-    uint64_t dither_time_us = 0;
-    uint64_t fb_get_time_us = 0;
-    uint64_t semaphore_wait_time_us = 0;
-    uint64_t frame_delta_time_us = 0;
-    uint32_t dither_samples = 0;
-    uint32_t fb_get_samples = 0;
-    uint32_t semaphore_wait_samples = 0;
-    uint32_t frame_delta_samples = 0;
     int next_strip = 0;
 
     while (true) {
-        int64_t fb_get_start_us = esp_timer_get_time();
         camera_fb_t *frame = esp_camera_fb_get();
-        fb_get_time_us += (uint64_t)(esp_timer_get_time() - fb_get_start_us);
-        fb_get_samples++;
         if (frame == NULL) {
-            // ESP_LOGE(TAG, "Camera did not return a frame");
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
 
-        int64_t frame_timestamp_us =
-            (int64_t)frame->timestamp.tv_sec * 1000000LL +
-            (int64_t)frame->timestamp.tv_usec;
-        if (previous_frame_timestamp_us != 0) {
-            last_frame_delta_us = frame_timestamp_us - previous_frame_timestamp_us;
-            if (last_frame_delta_us >= 0) {
-                frame_delta_time_us += (uint64_t)last_frame_delta_us;
-                frame_delta_samples++;
-            } else {
-                // ESP_LOGW(TAG, "Frame timestamp moved backwards by %lld us",
-                //          (long long)last_frame_delta_us);
-            }
-        }
-        previous_frame_timestamp_us = frame_timestamp_us;
-
         if (frame->width != LCD_WIDTH || frame->height != LCD_HEIGHT) {
-            // ESP_LOGE(TAG, "Frame size %ux%u does not match LCD %ux%u",
-            //          (unsigned)frame->width, (unsigned)frame->height,
-            //          LCD_WIDTH, LCD_HEIGHT);
             esp_camera_fb_return(frame);
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
@@ -242,8 +223,6 @@ void app_main(void)
 
         size_t expected_frame_len = LCD_WIDTH * LCD_HEIGHT * sizeof(uint16_t);
         if (frame->len != expected_frame_len) {
-            // ESP_LOGE(TAG, "Frame length %u does not match expected %u",
-            //          (unsigned)frame->len, (unsigned)expected_frame_len);
             esp_camera_fb_return(frame);
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
@@ -254,58 +233,19 @@ void app_main(void)
             next_strip = (next_strip + 1) % STRIP_BUFFERS;
 
             // Wait for the transfer that last used this buffer.
-            int64_t semaphore_wait_start_us = esp_timer_get_time();
             xSemaphoreTake(free_strip_buffers, portMAX_DELAY);
-            semaphore_wait_time_us +=
-                (uint64_t)(esp_timer_get_time() - semaphore_wait_start_us);
-            semaphore_wait_samples++;
 
-            int64_t dither_start_us = esp_timer_get_time();
+            // memcpy(strip, frame->buf + (size_t)y * ROW_BYTES, STRIP_BYTES);
             dither_strip(frame->buf + (size_t)y * ROW_BYTES, strip, y, LCD_STRIP_LINES);
-            dither_time_us += (uint64_t)(esp_timer_get_time() - dither_start_us);
 
             esp_err_t err = esp_lcd_panel_draw_bitmap(
                 panel, 0, y, LCD_WIDTH, y + LCD_STRIP_LINES, strip);
             if (err != ESP_OK) {
-                // ESP_LOGE(TAG, "LCD transfer failed: %s", esp_err_to_name(err));
                 // No completion callback will release this buffer.
                 xSemaphoreGive(free_strip_buffers);
             }
         }
         // Every strip is already copied out, the camera can refill this buffer.
         esp_camera_fb_return(frame);
-        dither_samples++;
-
-        int64_t now_us = esp_timer_get_time();
-        if (now_us - dither_window_start_us >= 1000000) {
-            // ESP_LOGI(TAG,
-            //          "Avg dithering: %.2f ms/frame (%u frames), "
-            //          "fb_get accumulated: %.2f ms (%u calls), "
-            //          "semaphore wait accumulated: %.2f ms (%u calls), "
-            //          "frame timestamp delta: last %.2f ms, avg %.2f ms (%u intervals)",
-            //          dither_samples
-            //              ? (double)dither_time_us / (double)dither_samples / 1000.0
-            //              : 0.0,
-            //          (unsigned)dither_samples,
-            //          (double)fb_get_time_us / 1000.0,
-            //          (unsigned)fb_get_samples,
-            //          (double)semaphore_wait_time_us / 1000.0,
-            //          (unsigned)semaphore_wait_samples,
-            //          (double)last_frame_delta_us / 1000.0,
-            //          frame_delta_samples
-            //              ? (double)frame_delta_time_us /
-            //                    (double)frame_delta_samples / 1000.0
-            //              : 0.0,
-            //          (unsigned)frame_delta_samples);
-            dither_window_start_us = now_us;
-            dither_time_us = 0;
-            fb_get_time_us = 0;
-            semaphore_wait_time_us = 0;
-            frame_delta_time_us = 0;
-            dither_samples = 0;
-            fb_get_samples = 0;
-            semaphore_wait_samples = 0;
-            frame_delta_samples = 0;
-        }
     }
 }

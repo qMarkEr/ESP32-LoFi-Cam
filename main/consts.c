@@ -15,7 +15,7 @@ const int8_t bayer8x8[8][8] = {
     { 5, -3, 3, -5, 4, -4, 2, -6 }
 };
 
-const Color palettesss[8][PALETTE_SIZE] = {
+const Color palettesss[9][PALETTE_SIZE] = {
     {
         { .r = 104, .g = 55, .b = 43, .dst = 15690 },   // #68372B
         { .r = 53, .g = 40, .b = 121, .dst = 19290 },   // #352879
@@ -71,5 +71,12 @@ const Color palettesss[8][PALETTE_SIZE] = {
         { .r = 129, .g = 108, .b = 97, .dst = 38834 },  // #816C61
         { .r = 168, .g = 155, .b = 157, .dst = 76418 }, // #A89B9D
         { .r = 207, .g = 207, .b = 234, .dst = 139014 },// #CFCFEA
+    },
+    {
+        { .r = 255, .g = 0,   .b = 0,   .dst = 65025 },  // #FF0000
+        { .r = 0,   .g = 0,   .b = 255, .dst = 65025 },  // #0000FF
+        { .r = 0,   .g = 255, .b = 0,   .dst = 65025 },  // #00FF00
+        { .r = 0,   .g = 255, .b = 255, .dst = 130050 }, // #00FFFF
+        { .r = 255, .g = 255, .b = 0,   .dst = 130050 }, // #FFFF00
     }
 };
