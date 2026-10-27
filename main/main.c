@@ -4,7 +4,6 @@
 
 #include "driver/spi_master.h"
 #include "esp_camera.h"
-#include "esp_cache.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_psram.h"
@@ -19,9 +18,26 @@
 #include "freertos/task.h"
 #include "main.h"
 
+#define ROW_BYTES (LCD_WIDTH * sizeof(uint16_t))
+#define STRIP_BYTES (ROW_BYTES * LCD_STRIP_LINES)
+#define STRIP_BUFFERS 2
+
+_Static_assert(LCD_WIDTH % 8 == 0, "dithering processes 8 pixels at a time");
+_Static_assert(LCD_HEIGHT % LCD_STRIP_LINES == 0, "strips must tile the frame");
+
+typedef struct {
+    const uint8_t *src;
+    uint8_t *dest;
+    int first_row;
+    int rows;
+} dither_job_t;
+
 static const char *TAG = "camera_lcd";
 static esp_lcd_panel_handle_t panel;
-static SemaphoreHandle_t color_transfer_done;
+static SemaphoreHandle_t free_strip_buffers;
+static TaskHandle_t main_task;
+static TaskHandle_t dither_task;
+static dither_job_t dither_job;
 
 static bool on_color_transfer_done(esp_lcd_panel_io_handle_t panel_io,
                                    esp_lcd_panel_io_event_data_t *event_data,
@@ -34,6 +50,33 @@ static bool on_color_transfer_done(esp_lcd_panel_io_handle_t panel_io,
     return task_woken == pdTRUE;
 }
 
+static void dither_worker(void *arg)
+{
+    (void)arg;
+    while (true) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        gameboy_dither_gray_to_rgb565(dither_job.src, dither_job.dest, LCD_WIDTH,
+                                      dither_job.rows, dither_job.first_row);
+        xTaskNotifyGive(main_task);
+    }
+}
+
+// The top half of the strip is dithered here, the bottom half on the other core.
+static void dither_strip(const uint8_t *src, uint8_t *dest, int first_row, int rows)
+{
+    int top_rows = rows / 2;
+    size_t offset = (size_t)top_rows * ROW_BYTES;
+    dither_job = (dither_job_t){
+        .src = src + offset,
+        .dest = dest + offset,
+        .first_row = first_row + top_rows,
+        .rows = rows - top_rows,
+    };
+    xTaskNotifyGive(dither_task);
+    gameboy_dither_gray_to_rgb565(src, dest, LCD_WIDTH, top_rows, first_row);
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+}
+
 static esp_err_t init_display(void)
 {
     spi_bus_config_t bus_config = {
@@ -42,7 +85,7 @@ static esp_err_t init_display(void)
         .miso_io_num = -1,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = LCD_WIDTH * LCD_HEIGHT * sizeof(uint16_t),
+        .max_transfer_sz = STRIP_BYTES,
     };
     ESP_RETURN_ON_ERROR(spi_bus_initialize(LCD_HOST, &bus_config, SPI_DMA_CH_AUTO),
                         TAG, "SPI bus init failed");
@@ -53,9 +96,9 @@ static esp_err_t init_display(void)
         .dc_gpio_num = LCD_PIN_DC,
         .spi_mode = 0,
         .pclk_hz = LCD_PIXEL_CLOCK_HZ,
-        .trans_queue_depth = 1,
+        .trans_queue_depth = STRIP_BUFFERS,
         .on_color_trans_done = on_color_transfer_done,
-        .user_ctx = color_transfer_done,
+        .user_ctx = free_strip_buffers,
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
     };
@@ -119,18 +162,28 @@ static esp_err_t init_camera(void)
 void app_main(void)
 {
     if (!esp_psram_is_initialized()) {
-        ESP_LOGE(TAG, "PSRAM is required for camera and display frame buffers");
+        ESP_LOGE(TAG, "PSRAM is required for camera frame buffers");
         return;
     }
 
-    uint8_t *display_fb = heap_caps_malloc(
-        LCD_WIDTH * LCD_HEIGHT * sizeof(uint16_t),
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    ESP_ERROR_CHECK(display_fb ? ESP_OK : ESP_ERR_NO_MEM);
+    // Strips live in internal RAM: no PSRAM writes, no cache sync, and the next
+    // strip is dithered while the previous one is still going out over SPI.
+    uint8_t *strips[STRIP_BUFFERS];
+    for (int i = 0; i < STRIP_BUFFERS; i++) {
+        strips[i] = heap_caps_malloc(STRIP_BYTES, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        ESP_ERROR_CHECK(strips[i] ? ESP_OK : ESP_ERR_NO_MEM);
+    }
     img_process_init();
 
-    color_transfer_done = xSemaphoreCreateBinary();
-    ESP_ERROR_CHECK(color_transfer_done ? ESP_OK : ESP_ERR_NO_MEM);
+    free_strip_buffers = xSemaphoreCreateCounting(STRIP_BUFFERS, STRIP_BUFFERS);
+    ESP_ERROR_CHECK(free_strip_buffers ? ESP_OK : ESP_ERR_NO_MEM);
+
+    main_task = xTaskGetCurrentTaskHandle();
+    BaseType_t worker_created = xTaskCreatePinnedToCore(
+        dither_worker, "dither", 3072, NULL, uxTaskPriorityGet(NULL), &dither_task,
+        (xPortGetCoreID() + 1) % portNUM_PROCESSORS);
+    ESP_ERROR_CHECK(worker_created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+
     ESP_ERROR_CHECK(init_display());
     ESP_ERROR_CHECK(init_camera());
 
@@ -142,6 +195,7 @@ void app_main(void)
     int64_t dither_window_start_us = esp_timer_get_time();
     uint64_t dither_time_us = 0;
     uint32_t dither_samples = 0;
+    int next_strip = 0;
 
     while (true) {
         camera_fb_t *frame = esp_camera_fb_get();
@@ -169,38 +223,37 @@ void app_main(void)
             continue;
         }
 
-        int64_t dither_start_us = esp_timer_get_time();
-        gameboy_dither_gray_to_rgb565(frame->buf, display_fb, frame->width, frame->height);
-        dither_time_us += (uint64_t)(esp_timer_get_time() - dither_start_us);
+        for (int y = 0; y < LCD_HEIGHT; y += LCD_STRIP_LINES) {
+            uint8_t *strip = strips[next_strip];
+            next_strip = (next_strip + 1) % STRIP_BUFFERS;
+
+            // Wait for the transfer that last used this buffer.
+            xSemaphoreTake(free_strip_buffers, portMAX_DELAY);
+
+            int64_t dither_start_us = esp_timer_get_time();
+            dither_strip(frame->buf + (size_t)y * ROW_BYTES, strip, y, LCD_STRIP_LINES);
+            dither_time_us += (uint64_t)(esp_timer_get_time() - dither_start_us);
+
+            esp_err_t err = esp_lcd_panel_draw_bitmap(
+                panel, 0, y, LCD_WIDTH, y + LCD_STRIP_LINES, strip);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "LCD transfer failed: %s", esp_err_to_name(err));
+                // No completion callback will release this buffer.
+                xSemaphoreGive(free_strip_buffers);
+            }
+        }
+        // Every strip is already copied out, the camera can refill this buffer.
+        esp_camera_fb_return(frame);
         dither_samples++;
 
-        esp_err_t sync_err = esp_cache_msync(
-            display_fb, frame->len,
-            ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
-        if (sync_err != ESP_OK && sync_err != ESP_ERR_NOT_SUPPORTED) {
-            ESP_LOGE(TAG, "Display buffer cache sync failed: %s", esp_err_to_name(sync_err));
-            esp_camera_fb_return(frame);
-            continue;
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - dither_window_start_us >= 1000000) {
+            ESP_LOGI(TAG, "Avg dithering: %.2f ms/frame (%u frames)",
+                     (double)dither_time_us / (double)dither_samples / 1000.0,
+                     (unsigned)dither_samples);
+            dither_window_start_us = now_us;
+            dither_time_us = 0;
+            dither_samples = 0;
         }
-
-        esp_err_t err = esp_lcd_panel_draw_bitmap(
-            panel, 0, 0, frame->width, frame->height, display_fb);
-        if (err == ESP_OK) {
-            xSemaphoreTake(color_transfer_done, portMAX_DELAY);
-            int64_t now_us = esp_timer_get_time();
-            if (now_us - dither_window_start_us >= 1000000) {
-                ESP_LOGI(TAG, "Avg dithering: %.2f ms/frame (%u frames)",
-                         dither_samples
-                             ? (double)dither_time_us / (double)dither_samples / 1000.0
-                             : 0.0,
-                         (unsigned)dither_samples);
-                dither_window_start_us = now_us;
-                dither_time_us = 0;
-                dither_samples = 0;
-            }
-        } else {
-            ESP_LOGE(TAG, "LCD transfer failed: %s", esp_err_to_name(err));
-        }
-        esp_camera_fb_return(frame);
     }
 }

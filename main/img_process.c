@@ -1,8 +1,16 @@
+#include <assert.h>
+
 #include "main.h"
 
-static uint16_t rb_square_lut[32][32];
-static uint16_t g_square_lut[32][64];
-static uint16_t packed_palette[PALETTE_SIZE];
+// One block per Bayer cell [y & 7][x & 7] holding clamp8(channel + threshold)^2.
+// R and B share the 5-bit table at [0..31], G uses [32..95].
+#define LUT_G 32
+#define LUT_BLOCK 96
+#define BUCKET_SHIFT 14
+
+static uint16_t square_lut[8][8][LUT_BLOCK];
+static uint32_t index_lut[(DST_MAX >> BUCKET_SHIFT) + 1];
+static uint32_t pair_palette[PALETTE_SIZE][PALETTE_SIZE];
 
 static inline uint8_t clamp8(int value)
 {
@@ -18,95 +26,92 @@ static inline uint16_t pack_rgb565(uint8_t r, uint8_t g, uint8_t b)
     return (red << 11) | (green << 5) | blue;
 }
 
-static inline uint8_t select_palette(uint32_t brightness,
-                                     uint32_t first,
-                                     uint32_t second,
-                                     uint32_t third)
-{
-    uint32_t min_diff = brightness;
-    uint8_t index = 0;
-    uint32_t diff = brightness > first ? brightness - first : first - brightness;
-    if (diff <= 10) {
-        return 1;
-    }
-    if (diff < min_diff) {
-        min_diff = diff;
-        index = 1;
-    }
-
-    diff = brightness > second ? brightness - second : second - brightness;
-    if (diff <= 10) {
-        return 2;
-    }
-    if (diff < min_diff) {
-        min_diff = diff;
-        index = 2;
-    }
-
-    diff = brightness > third ? brightness - third : third - brightness;
-    if (diff <= 10) {
-        return 3;
-    }
-    if (diff < min_diff) {
-        index = 3;
-    }
-    return index;
-}
-
 void img_process_init(void)
 {
-    for (int threshold_index = 0; threshold_index < 32; threshold_index++) {
-        int threshold = threshold_index - 16;
-        for (int channel = 0; channel < 32; channel++) {
-            int value = clamp8((channel << 3) + threshold);
-            rb_square_lut[threshold_index][channel] = (uint16_t)(value * value);
-        }
-        for (int channel = 0; channel < 64; channel++) {
-            int value = clamp8((channel << 2) + threshold);
-            g_square_lut[threshold_index][channel] = (uint16_t)(value * value);
+    for (int row = 0; row < 8; row++) {
+        for (int col = 0; col < 8; col++) {
+            int threshold = bayer8x8[row][col];
+            uint16_t *lut = square_lut[row][col];
+            for (int channel = 0; channel < 32; channel++) {
+                int value = clamp8((channel << 3) + threshold);
+                lut[channel] = (uint16_t)(value * value);
+            }
+            for (int channel = 0; channel < 64; channel++) {
+                int value = clamp8((channel << 2) + threshold);
+                lut[LUT_G + channel] = (uint16_t)(value * value);
+            }
         }
     }
 
+    // Nearest palette color by brightness (palette sorted by dst, ties go to the
+    // darker color, color 0 is anchored at brightness 0). That is the number of
+    // midpoints the brightness has reached, computed as
+    // (index_lut[b >> BUCKET_SHIFT] + b) >> 29: bits 29..31 hold the index at the
+    // bucket start, the low bits hold 2^29 - midpoint so reaching it carries into bit 29.
     const Color *palette = palettesss[0];
+    uint32_t bounds[PALETTE_SIZE - 1];
+    for (int i = 0; i < PALETTE_SIZE - 1; i++) {
+        uint32_t lower = i == 0 ? 0 : (uint32_t)palette[i].dst;
+        bounds[i] = (lower + (uint32_t)palette[i + 1].dst) / 2 + 1;
+    }
+    for (uint32_t bucket = 0; bucket < sizeof(index_lut) / sizeof(index_lut[0]); bucket++) {
+        uint32_t start = bucket << BUCKET_SHIFT;
+        uint32_t base = 0;
+        uint32_t carry = 0;
+        for (int i = 0; i < PALETTE_SIZE - 1; i++) {
+            if (bounds[i] <= start) {
+                base++;
+            } else if (bounds[i] < start + (1u << BUCKET_SHIFT)) {
+                assert(carry == 0 && "two palette midpoints in one bucket");
+                carry = (1u << 29) - bounds[i];
+            }
+        }
+        index_lut[bucket] = (base << 29) + carry;
+    }
+
+    // Two output pixels per word, high byte first as the panel expects.
+    uint16_t colors[PALETTE_SIZE];
     for (int i = 0; i < PALETTE_SIZE; i++) {
-        packed_palette[i] = pack_rgb565(palette[i].b, palette[i].g, palette[i].r);
+        uint16_t color = pack_rgb565(palette[i].b, palette[i].g, palette[i].r);
+        colors[i] = (uint16_t)((color >> 8) | (color << 8));
+    }
+    for (int first = 0; first < PALETTE_SIZE; first++) {
+        for (int second = 0; second < PALETTE_SIZE; second++) {
+            pair_palette[first][second] = colors[first] | ((uint32_t)colors[second] << 16);
+        }
     }
 }
 
-void gameboy_dither_gray_to_rgb565(const uint8_t *src, uint8_t *dest, int width, int height)
+// Camera RGB565 is big-endian, so a little-endian load gives
+// pixels[7:0] = RRRRRGGG and pixels[15:8] = GGGBBBBB.
+static inline uint32_t pixel_brightness(uint32_t pixels, const uint16_t *lut)
 {
-    const Color *palette = palettesss[0];
-    uint32_t palette_brightness[3] = {
-        (uint32_t)palette[1].dst,
-        (uint32_t)palette[2].dst,
-        (uint32_t)palette[3].dst,
-    };
-    size_t index = 0;
+    return lut[(pixels >> 3) & 0x1F] +
+           lut[LUT_G + (((pixels & 0x07) << 3) | ((pixels >> 13) & 0x07))] +
+           lut[(pixels >> 8) & 0x1F];
+}
+
+static inline uint32_t palette_index(uint32_t brightness)
+{
+    return (index_lut[brightness >> BUCKET_SHIFT] + brightness) >> 29;
+}
+
+// width must be a multiple of 8, src and dest 4-byte aligned. first_row is the
+// frame row of src[0], so strips keep their Bayer phase.
+void gameboy_dither_gray_to_rgb565(const uint8_t *src, uint8_t *dest, int width, int height, int first_row)
+{
+    const uint32_t *in = (const uint32_t *)src;
+    uint32_t *out = (uint32_t *)dest;
     for (int y = 0; y < height; y++) {
-        const int8_t *threshold_row = bayer8x8[y & 7];
-        for (int x = 0; x < width; x++) {
-            uint16_t pixel = ((uint16_t)src[index] << 8) | src[index + 1];
-            int threshold_index = threshold_row[x & 7] + 16;
-            uint32_t brightness =
-                rb_square_lut[threshold_index][(pixel >> 11) & 0x1F] +
-                g_square_lut[threshold_index][(pixel >> 5) & 0x3F] +
-                rb_square_lut[threshold_index][pixel & 0x1F];
-
-            uint8_t palette_index = 0;
-            if (brightness == DST_MAX) {
-                palette_index = PALETTE_SIZE - 1;
-            } else if (brightness != DST_MIN) {
-                palette_index = select_palette(
-                    brightness,
-                    palette_brightness[0],
-                    palette_brightness[1],
-                    palette_brightness[2]);
+        const uint16_t *row = square_lut[(first_row + y) & 7][0];
+        for (int x = 0; x < width; x += 8, in += 4, out += 4) {
+#pragma GCC unroll 4
+            for (int k = 0; k < 4; k++) {
+                uint32_t pixels = in[k];
+                uint32_t first = palette_index(pixel_brightness(pixels, row + (2 * k) * LUT_BLOCK));
+                uint32_t second = palette_index(pixel_brightness(pixels >> 16, row + (2 * k + 1) * LUT_BLOCK));
+                out[k] = pair_palette[first][second];
             }
-
-            uint16_t output = packed_palette[palette_index];
-            dest[index] = (uint8_t)(output >> 8);
-            dest[index + 1] = (uint8_t)output;
-            index += 2;
         }
     }
 }

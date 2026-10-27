@@ -9,6 +9,7 @@
 
 #define LCD_WIDTH 320
 #define LCD_HEIGHT 240
+#define LCD_STRIP_LINES 24
 #define PALETTE_SIZE 5
 #define DST_MAX (255 * 255 * 3)
 #define DST_MIN 0
