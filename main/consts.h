@@ -10,7 +10,7 @@
 #define LCD_WIDTH 320
 #define LCD_HEIGHT 240
 #define LCD_STRIP_LINES 24
-#define PALETTE_SIZE 5
+#define PALETTE_SIZE 11
 #define DST_MAX (255 * 255 * 3)
 #define DST_MIN 0
 #define DST_DIFF 1000
@@ -31,11 +31,14 @@
 #define LCD_PIN_DC     (3) 
 #define LCD_PIN_RESET  (2) 
 
+#define CONTRAST_STRENGTH 160
+
 typedef struct {
   uint8_t r, g, b;
-  int dst;
-} __packed Color;
+  // int dst;
+} Color;
 
 extern const uint8_t DB[8];
+extern const Color palettesss[1][PALETTE_SIZE];
 extern const int8_t bayer8x8[8][8];
-extern const Color palettesss[9][PALETTE_SIZE];
+extern const int8_t BAYER[4][4];

@@ -1,9 +1,15 @@
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <errno.h>
 
+#include "driver/gpio.h"
 #include "driver/spi_master.h"
+#include "driver/sdmmc_host.h"
 #include "esp_camera.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
@@ -13,6 +19,10 @@
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_st7789.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_vfs_fat.h"
+#include "img_converters.h"
+#include "sdmmc_cmd.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -21,6 +31,13 @@
 #define ROW_BYTES (LCD_WIDTH * sizeof(uint16_t))
 #define STRIP_BYTES (ROW_BYTES * LCD_STRIP_LINES)
 #define STRIP_BUFFERS 2
+#define TIMING_LOG_FRAME_COUNT 30
+
+#define SD_MOUNT_POINT "/sdcard"
+#define SDMMC_PIN_CMD GPIO_NUM_38
+#define SDMMC_PIN_CLK GPIO_NUM_39
+#define SDMMC_PIN_D0 GPIO_NUM_40
+#define SAVE_BUTTON_GPIO GPIO_NUM_20
 
 _Static_assert(LCD_WIDTH % 8 == 0, "dithering processes 8 pixels at a time");
 _Static_assert(LCD_HEIGHT % LCD_STRIP_LINES == 0, "strips must tile the frame");
@@ -38,6 +55,14 @@ static SemaphoreHandle_t free_strip_buffers;
 static TaskHandle_t main_task;
 static TaskHandle_t dither_task;
 static dither_job_t dither_job;
+static sdmmc_card_t *sd_card;
+static uint32_t picture_count;
+static portMUX_TYPE display_timing_mux = portMUX_INITIALIZER_UNLOCKED;
+static int64_t display_transfer_started_us[STRIP_BUFFERS];
+static uint8_t display_transfer_head;
+static uint8_t display_transfer_count;
+static uint64_t display_transfer_total_us;
+static uint32_t display_transfer_completed_count;
 
 static bool on_color_transfer_done(esp_lcd_panel_io_handle_t panel_io,
                                    esp_lcd_panel_io_event_data_t *event_data,
@@ -45,7 +70,20 @@ static bool on_color_transfer_done(esp_lcd_panel_io_handle_t panel_io,
 {
     (void)panel_io;
     (void)event_data;
+    int64_t completed_us = esp_timer_get_time();
     BaseType_t task_woken = pdFALSE;
+
+    portENTER_CRITICAL_ISR(&display_timing_mux);
+    if (display_transfer_count > 0) {
+        int64_t elapsed_us =
+            completed_us - display_transfer_started_us[display_transfer_head];
+        display_transfer_total_us += (uint64_t)elapsed_us;
+        display_transfer_completed_count++;
+        display_transfer_head = (display_transfer_head + 1) % STRIP_BUFFERS;
+        display_transfer_count--;
+    }
+    portEXIT_CRITICAL_ISR(&display_timing_mux);
+
     xSemaphoreGiveFromISR(user_ctx, &task_woken);
     return task_woken == pdTRUE;
 }
@@ -152,7 +190,7 @@ static esp_err_t init_camera(void)
         .ledc_channel   = LEDC_CHANNEL_0,
         .pixel_format   = PIXFORMAT_RGB565,
         .frame_size     = FRAMESIZE_QVGA,
-        .fb_count       = 2,
+        .fb_count       = 4,
         .fb_location    = CAMERA_FB_IN_PSRAM,
         .grab_mode      = CAMERA_GRAB_LATEST,
     };
@@ -168,15 +206,122 @@ static void setup_camera() {
     cm->set_denoise(cm, 0);
     cm->set_awb_gain(cm, 1);
     cm->set_wb_mode(cm, 0);
-    cm->set_brightness(cm, 1);
+    cm->set_brightness(cm, 0);
     cm->set_contrast(cm, 2);
     cm->set_special_effect(cm, 0);
     cm->set_lenc(cm, 1);
-    cm->set_gain_ctrl(cm, 1);
-    cm->set_exposure_ctrl(cm, 1);
+    cm->set_exposure_ctrl(cm, 0);
+    cm->set_aec_value(cm, 300);
+    cm->set_gain_ctrl(cm, 0);
+    cm->set_agc_gain(cm, 10);
     cm->set_aec2(cm, 1);
     cm->set_ae_level(cm, 0);
     cm->set_gainceiling(cm, GAINCEILING_128X);
+}
+
+
+static esp_err_t init_sd_card(void)
+{
+    const esp_vfs_fat_mount_config_t mount_config = {
+        .format_if_mount_failed = false,
+        .max_files = 2,
+        .allocation_unit_size = 0,
+    };
+    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
+    slot.clk = SDMMC_PIN_CLK;
+    slot.cmd = SDMMC_PIN_CMD;
+    slot.d0 = SDMMC_PIN_D0;
+    slot.width = 1;
+    slot.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
+
+    esp_err_t err = esp_vfs_fat_sdmmc_mount(
+        SD_MOUNT_POINT, &host, &slot, &mount_config, &sd_card);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "SD card mount failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG, "SD card mounted at %s", SD_MOUNT_POINT);
+    return ESP_OK;
+}
+
+static esp_err_t init_save_button(void)
+{
+    const gpio_config_t config = {
+        .pin_bit_mask = 1ULL << SAVE_BUTTON_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    return gpio_config(&config);
+}
+
+static esp_err_t save_frame_to_sd(camera_fb_t *frame)
+{
+    if (sd_card == NULL) {
+        ESP_LOGE(TAG, "Cannot save image: SD card is not mounted");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint8_t *jpeg_buffer = NULL;
+    size_t jpeg_size = 0;
+    if (!frame2jpg(frame, 90, &jpeg_buffer, &jpeg_size)) {
+        ESP_LOGE(TAG, "JPEG conversion failed");
+        free(jpeg_buffer);
+        return ESP_FAIL;
+    }
+
+    char path[40];
+    struct stat file_info;
+    while (true) {
+        int path_len = snprintf(path, sizeof(path), SD_MOUNT_POINT "/photo_%04u.jpg",
+                                (unsigned)picture_count);
+        if (path_len < 0 || (size_t)path_len >= sizeof(path)) {
+            free(jpeg_buffer);
+            return ESP_ERR_INVALID_SIZE;
+        }
+
+        if (stat(path, &file_info) == 0) {
+            picture_count++;
+            continue;
+        }
+        if (errno != ENOENT) {
+            ESP_LOGE(TAG, "Cannot check image path %s: errno %d", path, errno);
+            free(jpeg_buffer);
+            return ESP_FAIL;
+        }
+        break;
+    }
+
+    FILE *file = fopen(path, "wb");
+    if (file == NULL) {
+        ESP_LOGE(TAG, "Cannot open %s for writing: errno %d", path, errno);
+        free(jpeg_buffer);
+        return ESP_FAIL;
+    }
+
+    bool write_ok = fwrite(jpeg_buffer, 1, jpeg_size, file) == jpeg_size;
+    if (!write_ok) {
+        ESP_LOGE(TAG, "Failed writing image data to %s", path);
+    }
+    if (fclose(file) != 0) {
+        ESP_LOGE(TAG, "Failed closing %s: errno %d", path, errno);
+        write_ok = false;
+    }
+    free(jpeg_buffer);
+
+    if (!write_ok) {
+        if (remove(path) != 0) {
+            ESP_LOGE(TAG, "Failed removing incomplete image %s: errno %d", path, errno);
+        }
+        return ESP_FAIL;
+    }
+
+    picture_count++;
+    ESP_LOGI(TAG, "Saved %s (%u bytes)", path, (unsigned)jpeg_size);
+    return ESP_OK;
 }
 
 void app_main(void)
@@ -205,10 +350,24 @@ void app_main(void)
 
     ESP_ERROR_CHECK(init_display());
     setup_camera();
+    esp_err_t sd_err = init_sd_card();
+    if (sd_err != ESP_OK) {
+        ESP_LOGW(TAG, "Image saving is unavailable until restart");
+    }
+    ESP_ERROR_CHECK(init_save_button());
+    bool save_button_was_released = gpio_get_level(SAVE_BUTTON_GPIO) != 0;
 
     int next_strip = 0;
+    uint64_t frame_grab_total_us = 0;
+    uint64_t dither_total_us = 0;
+    uint32_t measured_frame_count = 0;
+    uint64_t last_display_transfer_total_us = 0;
+    uint32_t last_display_transfer_completed_count = 0;
+
+    s_curve_init();
 
     while (true) {
+        int64_t grab_started_us = esp_timer_get_time();
         camera_fb_t *frame = esp_camera_fb_get();
         if (frame == NULL) {
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -228,6 +387,8 @@ void app_main(void)
             continue;
         }
 
+        frame_grab_total_us += (uint64_t)(esp_timer_get_time() - grab_started_us);
+        uint64_t frame_dither_total_us = 0;
         for (int y = 0; y < LCD_HEIGHT; y += LCD_STRIP_LINES) {
             uint8_t *strip = strips[next_strip];
             next_strip = (next_strip + 1) % STRIP_BUFFERS;
@@ -236,15 +397,80 @@ void app_main(void)
             xSemaphoreTake(free_strip_buffers, portMAX_DELAY);
 
             // memcpy(strip, frame->buf + (size_t)y * ROW_BYTES, STRIP_BYTES);
+            int64_t dither_started_us = esp_timer_get_time();
             dither_strip(frame->buf + (size_t)y * ROW_BYTES, strip, y, LCD_STRIP_LINES);
+            frame_dither_total_us += (uint64_t)(esp_timer_get_time() - dither_started_us);
+
+            int64_t transfer_started_us = esp_timer_get_time();
+            portENTER_CRITICAL(&display_timing_mux);
+            if (display_transfer_count < STRIP_BUFFERS) {
+                uint8_t tail =
+                    (display_transfer_head + display_transfer_count) % STRIP_BUFFERS;
+                display_transfer_started_us[tail] = transfer_started_us;
+                display_transfer_count++;
+            }
+            portEXIT_CRITICAL(&display_timing_mux);
 
             esp_err_t err = esp_lcd_panel_draw_bitmap(
                 panel, 0, y, LCD_WIDTH, y + LCD_STRIP_LINES, strip);
             if (err != ESP_OK) {
+                portENTER_CRITICAL(&display_timing_mux);
+                if (display_transfer_count > 0) {
+                    display_transfer_count--;
+                }
+                portEXIT_CRITICAL(&display_timing_mux);
                 // No completion callback will release this buffer.
                 xSemaphoreGive(free_strip_buffers);
             }
         }
+        dither_total_us += frame_dither_total_us;
+        measured_frame_count++;
+
+        if (measured_frame_count == TIMING_LOG_FRAME_COUNT) {
+            uint64_t display_total_us;
+            uint32_t display_completed_count;
+            portENTER_CRITICAL(&display_timing_mux);
+            display_total_us =
+                display_transfer_total_us - last_display_transfer_total_us;
+            display_completed_count =
+                display_transfer_completed_count -
+                last_display_transfer_completed_count;
+            last_display_transfer_total_us = display_transfer_total_us;
+            last_display_transfer_completed_count = display_transfer_completed_count;
+            portEXIT_CRITICAL(&display_timing_mux);
+
+            uint64_t display_frame_us = 0;
+            if (display_completed_count > 0) {
+                display_frame_us = display_total_us * (LCD_HEIGHT / LCD_STRIP_LINES) /
+                                   display_completed_count;
+            }
+            ESP_LOGI(TAG,
+                     "avg over %u frames: fb_get=%llu us, dithering=%llu us, "
+                     "LCD DMA/frame~%llu us (%u completed strips)",
+                     (unsigned)measured_frame_count,
+                     (unsigned long long)(frame_grab_total_us / measured_frame_count),
+                     (unsigned long long)(dither_total_us / measured_frame_count),
+                     (unsigned long long)display_frame_us,
+                     (unsigned)display_completed_count);
+
+            frame_grab_total_us = 0;
+            dither_total_us = 0;
+            measured_frame_count = 0;
+        }
+
+        bool save_button_is_released = gpio_get_level(SAVE_BUTTON_GPIO) != 0;
+        if (save_button_was_released && !save_button_is_released) {
+            vTaskDelay(pdMS_TO_TICKS(30));
+            save_button_is_released = gpio_get_level(SAVE_BUTTON_GPIO) != 0;
+            if (!save_button_is_released) {
+                esp_err_t save_err = save_frame_to_sd(frame);
+                if (save_err != ESP_OK) {
+                    ESP_LOGE(TAG, "Image save failed: %s", esp_err_to_name(save_err));
+                }
+            }
+        }
+        save_button_was_released = save_button_is_released;
+
         // Every strip is already copied out, the camera can refill this buffer.
         esp_camera_fb_return(frame);
     }
