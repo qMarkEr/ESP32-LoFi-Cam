@@ -3,23 +3,14 @@
 #define SATURATION 512
 #define LUMA_WEIGHT 2
 
-static uint8_t palette_index = 0;
+static uint8_t palette_index = 3;
 
-static uint8_t s_curve[256];
-
-static inline uint8_t clamp(int v) {
-  return v < 0 ? 0 : ((v > 255) ? 255 : (uint8_t)v);
+void NextPalette(void) {
+	palette_index = (palette_index + 1) % PALETTE_COUNT;
 }
-
-void s_curve_init(void) {
-  for (int x = 0; x < 256; x++) {
-    // smoothstep: 3t² − 2t³, t = x/255, в целых числах
-    int s = (x * x * (765 - 2 * x) + 32512) / 65025;      // 0..255
-    // смешивание с исходным значением
-    s_curve[x] = clamp(x + (((s - x) * CONTRAST_STRENGTH) >> 8));
-  }
+uint8_t GetPaletteIndex(void) {
+	return palette_index;
 }
-
 
 static inline uint16_t pack_rgb565(uint8_t r, uint8_t g, uint8_t b) {
   uint16_t R = ((r * 31 + 127) >> 8);
@@ -29,28 +20,27 @@ static inline uint16_t pack_rgb565(uint8_t r, uint8_t g, uint8_t b) {
   return (R << 11) | (G << 5) | B;
 }
 
-static int increase_contrast(int value) {
-    return clamp(128 + (((value - 128) * 3) >> 1));
+static inline uint8_t clamp(int v) {
+  return v < 0 ? 0 : ((v > 255) ? 255 : (uint8_t)v);
 }
 
-void gameboy_dither_gray_to_rgb565(const uint8_t *src, uint8_t *dest, int width, int height, int first_row) {
+static inline uint8_t to5(int v) { return (uint8_t)((v * 31 + 127) / 255); }
+static inline uint8_t to6(int v) { return (uint8_t)((v * 63 + 127) / 255); }
+
+void Dither(const uint8_t *src, uint8_t *dest, int width, int height, int first_row) {
 	const Color *palette = palettesss[palette_index];
 	for (int row = 0; row < height; row++) {
 		int y = first_row + row;
 		for (int x = 0; x < width; x++) {
 			size_t index = ((size_t)row * width + x) * 2;
-			uint16_t pixel = ((uint16_t)src[index] << 8) | (src[index + 1]);
 
-			int b5 = (pixel >> 11) & 0x1F;
-			int g6 = (pixel >> 5) & 0x3F;
-			int r5 = pixel & 0x1F;
-			int r = (b5 << 3) | (b5 >> 2);
-			int g = (g6 << 2) | (g6 >> 4);
-			int b = (r5 << 3) | (r5 >> 2);
+			Color pixel = { .raw = (src[index] << 8) | src[index + 1] };
 
-			r = s_curve[r];
-			g = s_curve[g];
-			b = s_curve[b];
+			int r = (pixel.r << 3) | (pixel.r >> 2);
+			int g = (pixel.g << 2) | (pixel.g >> 4);
+			g = (g * 235) >> 8;
+
+			int b = (pixel.b << 3) | (pixel.b >> 2);
 
 			int luma = (r * 77 + g * 150 + b * 29) >> 8;
 			int threshold = BAYER[y & 3][x & 3];
@@ -58,12 +48,17 @@ void gameboy_dither_gray_to_rgb565(const uint8_t *src, uint8_t *dest, int width,
 			g = clamp(luma + (((g - luma) * SATURATION) >> 8) + threshold);
 			b = clamp(luma + (((b - luma) * SATURATION) >> 8) + threshold);
 
+			Color q;
+			q.r = to5(r);
+			q.g = to6(g);
+			q.b = to5(b);
+
 			uint8_t palette_entry = 0;
 			int best_distance = 0x7FFFFFFF;
 			for (uint8_t i = 0; i < PALETTE_SIZE; i++) {
-				int dr = r - palette[i].r;
-				int dg = g - palette[i].g;
-				int db = b - palette[i].b;
+				int dr = ((int)q.r - palette[i].r) * 8;
+				int dg = ((int)q.g - palette[i].g) * 4;
+				int db = ((int)q.b - palette[i].b) * 8;
 				int dl = (dr * 77 + dg * 150 + db * 29) >> 8;
 				int distance = dr * dr + dg * dg + db * db +
 							LUMA_WEIGHT * dl * dl;
@@ -75,14 +70,8 @@ void gameboy_dither_gray_to_rgb565(const uint8_t *src, uint8_t *dest, int width,
 					}
 				}
 			}
-
-			uint16_t out = pack_rgb565(
-				palette[palette_entry].r,
-				palette[palette_entry].g,
-				palette[palette_entry].b
-			);
-			dest[index] = out >> 8;
-			dest[index + 1] = out & 0xFF;
+			dest[index] = palette[palette_entry].raw >> 8;
+			dest[index + 1] = palette[palette_entry].raw & 0xFF;
 		}
 	}
 }
